@@ -1,0 +1,4 @@
+admission:
+  managedNamespaceSelector:
+    matchLabels:
+      managed-by-slurm: "true"

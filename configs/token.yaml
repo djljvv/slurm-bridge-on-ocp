@@ -1,0 +1,15 @@
+apiVersion: slinky.slurm.net/v1beta1
+kind: Token
+metadata:
+  name: slurm-bridge-token
+  namespace: slinky
+spec:
+  jwtKeyRef:
+    name: slurm-auth-jwt
+    key: jwt.key
+  secretRef:
+    name: slurm-bridge-token
+    key: auth-token
+  username: slurm
+  refresh: true
+  lifetime: 8760h

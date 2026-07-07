@@ -1,0 +1,15 @@
+loginsets:
+  slinky:
+    enabled: false
+
+controller:
+  extraConfMap:
+    MCSPlugin: mcs/label
+    MCSParameters: ondemand,ondemandselect
+  service:
+    spec:
+      type: ClusterIP
+
+nodesets:
+  slinky:
+    replicas: 0
