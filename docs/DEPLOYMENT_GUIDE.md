@@ -69,6 +69,10 @@ oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator
 # Or manually:
 oc create namespace slurm
 oc adm policy add-scc-to-user anyuid -z default -n slurm
+# slurmd needs privileged mode + BPF/NET_ADMIN/SYS_ADMIN capabilities (cgroup +
+# process/network management). Without this, NodeSet pods are rejected by OCP's
+# SCC admission and the NodeSet can never scale above 0 replicas.
+oc adm policy add-scc-to-user privileged -z default -n slurm
 
 helm upgrade --install slurm \
   oci://ghcr.io/slinkyproject/charts/slurm \
@@ -90,20 +94,39 @@ oc exec -n slurm $CTRL -c slurmctld -- sinfo
 ./scripts/deploy-bridge.sh
 
 # Or manually:
+# 0. RBAC patch for the Slinky operator (OCP workaround). The Token controller
+#    creates a Secret owned by the Token CR with blockOwnerDeletion=true, which
+#    Kubernetes only allows if the operator has "update" on the finalizers
+#    subresource of the owner's kind. The operator's default ClusterRole only
+#    grants plain "secrets" permissions, not "secrets/finalizers" — without this
+#    patch, the Token controller fails every reconcile with "cannot set
+#    blockOwnerDeletion if an ownerReference refers to a resource you can't set
+#    finalizers on" and never creates "slurm-bridge-token", so all Bridge pods
+#    stay stuck with "secret not found". Apply before the Token CR so the first
+#    reconcile succeeds instead of waiting through backoff retries.
+oc patch clusterrole slurm-operator \
+  --type='json' \
+  -p='[{"op":"add","path":"/rules/-","value":{"apiGroups":[""],"resources":["secrets/finalizers"],"verbs":["update"]}}]'
+
 # 1. Apply JWT token CR (Bridge authenticates to slurmrestd)
 oc apply -f configs/token.yaml
 
-# 2. Install Bridge via Helm
+# 2. Install Bridge via Helm — into the "slurm" namespace, NOT "slinky".
+#    Bridge's Token CR reads the "slurm-auth-jwt" secret from its own
+#    namespace, and that secret only exists where the Slurm Helm chart
+#    created it (the cluster namespace). Installing into "slinky" leaves
+#    the Token controller unable to find it, so Bridge pods fail with
+#    "secret \"slurm-bridge-token\" not found".
 helm upgrade --install slurm-bridge \
   oci://ghcr.io/slinkyproject/charts/slurm-bridge \
-  --namespace slinky --create-namespace \
+  --namespace slurm --create-namespace \
   -f configs/slurm-bridge-values.yaml
 
-oc rollout status deployment/slurm-bridge-admission -n slinky --timeout=300s
-oc rollout status deployment/slurm-bridge-controllers -n slinky --timeout=300s
-oc rollout status deployment/slurm-bridge-scheduler -n slinky --timeout=300s
+oc rollout status deployment/slurm-bridge-admission -n slurm --timeout=300s
+oc rollout status deployment/slurm-bridge-controllers -n slurm --timeout=300s
+oc rollout status deployment/slurm-bridge-scheduler -n slurm --timeout=300s
 
-# 3. RBAC patch (OCP workaround — may be fixed in Bridge v1.1.1+)
+# 3. RBAC patch for the Bridge scheduler (separate OCP workaround — may be fixed in Bridge v1.1.1+)
 oc patch clusterrole slurm-bridge-scheduler \
   --type='json' \
   -p='[{"op":"add","path":"/rules/-","value":{"apiGroups":[""],"resources":["pods/finalizers"],"verbs":["update","patch"]}}]'
@@ -130,23 +153,40 @@ oc logs -n slurm -l app.kubernetes.io/name=slurm-autoscaler -f
 ## Verification
 
 ```bash
-# Cluster health
-./scripts/test-slurm.sh
-
-# Check all components
+# Check all components (Bridge lives in the "slurm" namespace, alongside slurmctld/slurmrestd)
 oc get pods -n slurm
-oc get pods -n slinky | grep bridge
-
-# Submit a test job (autoscaler will scale up automatically)
-CTRL=$(oc get pods -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')
-oc exec -n slurm $CTRL -c slurmctld -- sbatch --nodes=2 --wrap="hostname && date && sleep 10"
-
-# Watch autoscaler react
-oc logs -n slurm -l app.kubernetes.io/name=slurm-autoscaler -f --tail=20
-
-# Watch pods scale up
-watch -n 5 'oc get pods -n slurm'
+oc get pods -n slurm | grep bridge
 ```
+
+> **Note:** `./scripts/test-slurm.sh` (its default "quick" mode) currently fails on a fresh
+> deployment — it submits an `sbatch` job immediately, before any `slinky-N` worker has ever
+> registered, and hits the same rejection described below. This script has not yet been
+> updated to account for that; don't treat a failure there as a sign your deployment is
+> broken.
+
+Submit a job through Bridge to confirm the end-to-end path works (this is the path that
+actually functions out of the box — see the caveat below for why a plain `sbatch` example
+isn't shown here):
+
+```bash
+oc label namespace default managed-by-slurm=true
+oc run bridge-test --image=quay.io/prometheus/busybox --restart=Never \
+  --overrides='{"metadata":{"annotations":{"slurmjob.slinky.slurm.net/account":"slurm","slurmjob.slinky.slurm.net/partition":"all"}}}' \
+  -- sh -c "hostname && date"
+
+# Confirm it ran as a Slurm job
+CTRL=$(oc get pods -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')
+oc exec -n slurm $CTRL -c slurmctld -- squeue
+oc logs bridge-test
+```
+
+**Do not expect a plain `sbatch --nodes=N ...` example to demonstrate autoscaling** — under
+this chart's default config (`MIN_REPLICAS=0`, no NodeSet workers registered yet), Slurm
+rejects such a request immediately (`Requested node configuration is not available`) instead
+of queuing it `PENDING`, so the autoscaler never gets a chance to react. This was confirmed by
+live testing, not just code review. See
+[`docs/ARCHITECTURE.md`](ARCHITECTURE.md#autoscaler) for the full explanation and what
+`sbatch` behavior to actually expect.
 
 ---
 
@@ -178,23 +218,41 @@ Pods created in that namespace will be intercepted by Bridge and scheduled via S
 
 **Bridge pods not starting:**
 ```bash
-oc describe pod -n slinky -l app.kubernetes.io/name=slurm-bridge
-# Common cause: cert-manager not ready, or token CR applied before slurmrestd was up
+oc describe pod -n slurm -l app.kubernetes.io/name=slurm-bridge
+# Common causes:
+#  - cert-manager not ready, or token CR applied before slurmrestd was up
+#  - Bridge/Token CR installed into the wrong namespace (must be "slurm", not "slinky") —
+#    check for "secret \"slurm-bridge-token\" not found" in pod events:
+oc get events -n slurm --sort-by=.lastTimestamp | grep -i "slurm-bridge-token"
 ```
 
 **slurmrestd not reachable by Bridge:**
 ```bash
 oc get svc -n slurm | grep restapi
-oc logs -n slinky -l app.kubernetes.io/name=slurm-bridge-controllers
+oc logs -n slurm -l app.kubernetes.io/name=slurm-bridge-controllers
 ```
 
 **Autoscaler not scaling up:**
+
+This is expected, not a misconfiguration you need to debug — see the "Known limitation" note
+in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#autoscaler). In short: a direct `sbatch` job
+requesting more nodes than are currently registered gets rejected by Slurm immediately
+(`Requested node configuration is not available`) instead of going `PENDING`, so the
+autoscaler — which only reacts to `PENDING` jobs in `squeue` — never has anything to scale up
+in response to. This happens regardless of whether the NodeSet starts at 0 or already has
+workers registered.
+
 ```bash
 oc logs -n slurm -l app.kubernetes.io/name=slurm-autoscaler --tail=30
-# Check: is the controller pod reachable? Does squeue show PENDING jobs?
+# If you see repeated "IDLE: no jobs" with no PENDING jobs ever appearing in squeue even
+# though you submitted one, that confirms the job was rejected at submission, not queued:
 CTRL=$(oc get pods -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')
 oc exec -n slurm $CTRL -c slurmctld -- squeue
 ```
+
+Workarounds: submit through Bridge instead (works from zero, see Verification above), or
+manually scale first — `oc scale nodeset slurm-worker-slinky -n slurm --replicas=N` — then
+submit a job that fits within N nodes.
 
 **RBAC patch warning:**
 If the Bridge scheduler pod is crashing with permission errors, reapply the patch:

@@ -13,3 +13,12 @@ controller:
 nodesets:
   slinky:
     replicas: 0
+
+# The chart does not define any partition by default (partitions.all.enabled
+# is false out of the box). Without this, slurmctld has zero partitions and
+# every "sbatch" submission — direct or via Bridge — is rejected immediately
+# with "No partition specified or system default partition", regardless of
+# NodeSet replica count. This must be enabled for jobs to be schedulable at all.
+partitions:
+  all:
+    enabled: true

@@ -1,6 +1,6 @@
 # Slurm Bridge on OCP
 
-Deploys Slurm with Slurm Bridge on Red Hat OpenShift using the Slinky operator. Extends [slurm-on-ocp](https://github.com/RHEcosystemAppEng/slurm-on-ocp) with Bridge support and a fully autonomous queue-driven autoscaler.
+Deploys Slurm with Slurm Bridge on Red Hat OpenShift using the Slinky operator. Extends [slurm-on-ocp](https://github.com/RHEcosystemAppEng/slurm-on-ocp) with Bridge support and a queue-driven autoscaler design (see caveat below — scale-up currently doesn't trigger for direct `sbatch` under this chart's default config).
 
 ## What's different from slurm-on-ocp
 
@@ -9,7 +9,7 @@ Deploys Slurm with Slurm Bridge on Red Hat OpenShift using the Slinky operator. 
 | Deployment | Raw YAML CRs | Helm chart (includes REST API) |
 | Slurm REST API | Not deployed | Deployed (required by Bridge) |
 | Slurm Bridge | Not included | Included |
-| Autoscaler scale-up | Launcher script | Autonomous (queue-driven) |
+| Autoscaler scale-up | Launcher script (client pre-scales before submit) | Reactive/queue-driven by design — currently non-functional, see below |
 | Job submission | `oc exec ... sbatch` | `sbatch` direct or via Bridge API |
 
 ## Quick Start
@@ -23,13 +23,28 @@ Deploys Slurm with Slurm Bridge on Red Hat OpenShift using the Slinky operator. 
 # If operator already installed via OperatorHub
 ./scripts/deploy.sh --skip-operator
 
-# Verify
-./scripts/test-slurm.sh
+# Verify components are up (NOTE: ./scripts/test-slurm.sh's default "quick" mode
+# currently fails on a fresh deploy — it submits an sbatch job before any worker
+# has registered and hits the same rejection described below. Not yet fixed.)
+oc get pods -n slurm
 
-# Submit a job — autoscaler scales up automatically
-CTRL=$(oc get pods -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')
-oc exec -n slurm $CTRL -c slurmctld -- sbatch --nodes=2 --wrap="hostname && date"
+# Submit a job through Bridge (works from 0 replicas — Bridge schedules onto
+# the underlying OCP worker nodes registered during deploy-bridge.sh)
+oc label namespace default managed-by-slurm=true
+oc run bridge-test --image=quay.io/prometheus/busybox --restart=Never \
+  --overrides='{"metadata":{"annotations":{"slurmjob.slinky.slurm.net/account":"slurm","slurmjob.slinky.slurm.net/partition":"all"}}}' \
+  -- sh -c "hostname && date"
 ```
+
+> **Note:** direct `sbatch` (bypassing Bridge) does not actually trigger autoscaling under
+> this chart's default config — Slurm rejects a job outright ("Requested node configuration
+> is not available") instead of queuing it `PENDING` whenever it asks for more nodes than are
+> currently registered, regardless of whether the NodeSet is at 0 or already has workers.
+> Since the job never reaches `PENDING`, the autoscaler (which only reacts to `PENDING` jobs)
+> never gets triggered. Bridge jobs work because they use a separate, statically-sized pool
+> of "external nodes" — not the scaled NodeSet. See
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#autoscaler) for details and what it would
+> take to make this actually work.
 
 ## Repository Structure
 
@@ -60,7 +75,7 @@ slurm-bridge-on-ocp/
 
 **Slurm Bridge** provides a Kubernetes-native API for job submission. Pods created in namespaces labeled `managed-by-slurm: "true"` are intercepted by Bridge's admission controller and scheduled via Slurm instead of the default Kubernetes scheduler.
 
-**Autoscaler** monitors `squeue` every 30 seconds. When pending jobs need more nodes than are available, it scales the NodeSet up. After 5 minutes with no jobs, it scales back down. Any job source triggers this — manual `sbatch`, Bridge, notebooks, or CI pipelines.
+**Autoscaler** monitors `squeue` every 30 seconds. By design, when pending jobs need more nodes than are available, it should scale the NodeSet up, and scale back down after 5 idle minutes. In practice, scale-up currently never triggers (see the Quick Start note above and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#autoscaler)) — jobs needing more nodes than exist are rejected by Slurm before reaching `PENDING`, so the autoscaler has nothing to react to. Scale-down still works correctly for whatever replicas exist.
 
 ## Cleanup
 

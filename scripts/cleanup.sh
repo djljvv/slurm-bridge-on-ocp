@@ -50,10 +50,10 @@ run_ignore oc delete -f "${REPO_ROOT}/configs/slurm-autoscaler.yaml" --ignore-no
 run_ignore oc delete configmap slurm-autoscaler-script -n "$NAMESPACE" --ignore-not-found --timeout=30s
 
 # ---------------------------------------------------------------------------
-# 2. Bridge
+# 2. Bridge (lives in the Slurm cluster namespace, not the operator namespace)
 # ---------------------------------------------------------------------------
 section "Removing Slurm Bridge"
-"${SCRIPT_DIR}/deploy-bridge.sh" --operator-ns "$OPERATOR_NS" --teardown 2>/dev/null || true
+"${SCRIPT_DIR}/deploy-bridge.sh" --namespace "$NAMESPACE" --teardown 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 3. Slurm cluster
@@ -68,6 +68,7 @@ if oc get namespace "$NAMESPACE" &>/dev/null; then
   run_ignore oc delete svc,configmap,secret,pvc --all -n "$NAMESPACE" --ignore-not-found --timeout=60s
   run_ignore oc delete controller,nodeset,restapi --all -n "$NAMESPACE" --ignore-not-found --timeout=60s
   run_ignore oc adm policy remove-scc-from-user anyuid -z default -n "$NAMESPACE"
+  run_ignore oc adm policy remove-scc-from-user privileged -z default -n "$NAMESPACE"
   run_ignore oc adm policy remove-scc-from-user privileged -z slurm-autoscaler -n "$NAMESPACE"
   oc delete namespace "$NAMESPACE" --ignore-not-found --timeout=120s 2>/dev/null || \
     warn "Namespace $NAMESPACE may still be terminating"

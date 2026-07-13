@@ -67,7 +67,12 @@ spec:
         kubernetes.io/os: linux
       containers:
         - name: autoscaler
-          image: bitnami/kubectl:1.29
+          # bitnami/kubectl was deprecated (Bitnami stopped publishing free,
+          # version-pinned tags on Docker Hub) — "bitnami/kubectl:1.29" now
+          # 404s with "manifest unknown". alpine/k8s is actively maintained,
+          # multi-arch, and ships both kubectl and a shell (needed for
+          # autoscaler.sh, which runs via /bin/sh).
+          image: alpine/k8s:1.34.9
           command: ["/bin/sh", "/scripts/autoscaler.sh"]
           env:
             - name: NAMESPACE

@@ -48,6 +48,15 @@ log "Granting anyuid SCC to default service account..."
 oc adm policy add-scc-to-user anyuid -z default -n "$NAMESPACE" 2>/dev/null || \
   warn "anyuid SCC may already be granted"
 
+# slurmd requires privileged mode + BPF/NET_ADMIN/SYS_ADMIN capabilities
+# (cgroup + process/network management). Without this, NodeSet pods
+# ("slurm-worker-slinky-N") are rejected by OpenShift's SCC admission with
+# "unable to validate against any security context constraint" and the
+# NodeSet can never scale above 0 replicas — anyuid alone is not enough.
+log "Granting privileged SCC to default service account (required by slurmd)..."
+oc adm policy add-scc-to-user privileged -z default -n "$NAMESPACE" 2>/dev/null || \
+  warn "privileged SCC may already be granted"
+
 # Install Slurm via Helm (includes controller, nodeset, restapi)
 log "Installing Slurm via Helm chart (version 1.2.0)..."
 helm upgrade --install slurm \

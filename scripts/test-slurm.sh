@@ -2,18 +2,27 @@
 
 ###############################################################################
 # Slurm Cluster Test Script
-# 
+#
 # Comprehensive test script for Slurm cluster on OpenShift
-# 
+#
+# Both modes submit plain `sbatch` jobs, which do not trigger autoscaling from
+# zero replicas under this chart's default config (see docs/ARCHITECTURE.md
+# #autoscaler for why). Before submitting anything, this script checks for an
+# already-running worker pod and, if none exists, scales the NodeSet to 1
+# replica itself and waits for it to register. This validates that Slurm job
+# submission/scheduling/output retrieval works — it intentionally does not
+# test the (currently non-functional) autoscaler reactive scale-up path.
+#
 # Usage: ./test-slurm.sh [options]
-# 
+#
 # Options:
 #   --namespace NAMESPACE    Cluster namespace (default: slurm)
+#   --nodeset NODESET        NodeSet name (default: slurm-worker-slinky)
 #   --controller-pod POD     Controller pod name (auto-detected if not provided)
 #   --quick                  Quick end-to-end test (single job, verify output)
 #   --comprehensive          Comprehensive test suite (multiple job types)
 #   --help                   Show this help message
-# 
+#
 # Default: Quick test (--quick)
 ###############################################################################
 
@@ -21,6 +30,7 @@ set -euo pipefail
 
 # Default values
 NAMESPACE="slurm"
+NODESET="slurm-worker-slinky"
 CONTROLLER_POD=""
 QUICK_MODE=true
 COMPREHENSIVE_MODE=false
@@ -37,6 +47,10 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --namespace)
       NAMESPACE="$2"
+      shift 2
+      ;;
+    --nodeset)
+      NODESET="$2"
       shift 2
       ;;
     --controller-pod)
@@ -58,6 +72,7 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Options:"
       echo "  --namespace NAMESPACE    Cluster namespace (default: slurm)"
+      echo "  --nodeset NODESET        NodeSet name (default: slurm-worker-slinky)"
       echo "  --controller-pod POD     Controller pod name (auto-detected if not provided)"
       echo "  --quick                  Quick end-to-end test (default)"
       echo "  --comprehensive          Comprehensive test suite"
@@ -91,6 +106,79 @@ log_section() {
   echo ""
 }
 
+# Ensure at least one slurmd worker is registered before submitting any job.
+#
+# Direct `sbatch` (what this script uses) does not actually trigger autoscaling
+# under this chart's default config: with 0 NodeSet replicas, slurmctld has
+# never seen a worker of that type register, so `sbatch` is rejected immediately
+# ("Requested node configuration is not available") instead of queuing the job
+# `PENDING` for the autoscaler to react to. See docs/ARCHITECTURE.md#autoscaler
+# for the full explanation. This function works around that by scaling the
+# NodeSet up once, manually, so this test can actually validate that Slurm job
+# submission/scheduling/output retrieval works — it does not test autoscaling
+# itself (nothing currently does, since autoscaling doesn't trigger from sbatch).
+worker_pod_ready() {
+  # Counts Running slurmd pods for the NodeSet — more reliable than grepping
+  # sinfo node names, since Bridge's "external nodes" (real OCP hostnames like
+  # ip-10-0-*.ec2.internal) also show up in sinfo and would false-positive a
+  # naive name-based match. Label is app.kubernetes.io/instance=<nodeset> +
+  # app.kubernetes.io/name=slurmd (verified against the actual chart output —
+  # NOT nodeset.slinky.slurm.net/name, which doesn't exist on these pods).
+  oc get pods -n "$NAMESPACE" \
+    -l "app.kubernetes.io/instance=$NODESET,app.kubernetes.io/name=slurmd" \
+    --field-selector=status.phase=Running -o name 2>/dev/null | wc -l | tr -d ' '
+}
+
+ensure_worker_available() {
+  log_info "Checking for a registered Slurm worker..."
+
+  if [ "$(worker_pod_ready)" -ge 1 ]; then
+    log_info "Worker pod already running — skipping bootstrap"
+    return 0
+  fi
+
+  local replicas
+  replicas=$(oc get nodeset "$NODESET" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+
+  log_warn "No worker pod running yet (NodeSet replicas: $replicas)."
+  log_warn "Direct sbatch can't trigger autoscaling from zero (see docs/ARCHITECTURE.md#autoscaler)."
+  log_info "Scaling NodeSet '$NODESET' to 1 replica so this test can proceed..."
+  oc scale nodeset "$NODESET" -n "$NAMESPACE" --replicas=1
+
+  log_info "Waiting for worker pod to be Running (timeout: 120s)..."
+  local waited=0
+  while [ "$waited" -lt 120 ]; do
+    if [ "$(worker_pod_ready)" -ge 1 ]; then
+      break
+    fi
+    sleep 10
+    waited=$((waited + 10))
+    log_info "  ...still waiting for pod (${waited}s elapsed)"
+  done
+
+  if [ "$(worker_pod_ready)" -lt 1 ]; then
+    log_error "Timed out waiting for worker pod. Job submission will likely fail."
+    log_info "Check: oc get pods -n $NAMESPACE -l app.kubernetes.io/instance=$NODESET,app.kubernetes.io/name=slurmd"
+    return 1
+  fi
+
+  log_info "Waiting for worker to register with slurmctld and reach idle state (timeout: 90s)..."
+  waited=0
+  while [ "$waited" -lt 90 ]; do
+    if oc exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -- \
+        sinfo -h -N -o "%T" 2>/dev/null | grep -qE "idle|mix"; then
+      log_info "Worker registered and idle."
+      return 0
+    fi
+    sleep 10
+    waited=$((waited + 10))
+    log_info "  ...still waiting for Slurm registration (${waited}s elapsed)"
+  done
+
+  log_error "Worker pod is Running but never registered as idle in Slurm. Job submission may fail."
+  return 1
+}
+
 # Get controller pod if not provided
 if [ -z "$CONTROLLER_POD" ]; then
   log_info "Auto-detecting controller pod..."
@@ -105,6 +193,12 @@ fi
 
 log_info "Using controller pod: $CONTROLLER_POD"
 log_info "Namespace: $NAMESPACE"
+echo ""
+
+# Both modes submit sbatch jobs that need an already-registered worker (see
+# ensure_worker_available's comment above for why this can't just rely on the
+# autoscaler).
+ensure_worker_available
 echo ""
 
 # Quick test mode (default)
@@ -138,7 +232,12 @@ if [ "$QUICK_MODE" = true ]; then
   echo ""
   
   log_info "7. Finding which compute node ran the job..."
-  NODE_LIST=$(oc exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -- scontrol show job "$JOB_ID" 2>/dev/null | grep "NodeList=" | awk '{print $1}' | cut -d= -f2)
+  # Anchored on a preceding whitespace/line-start so this only matches the
+  # "NodeList=" field itself — a plain `grep "NodeList="` also matches
+  # "ReqNodeList=" and "ExcNodeList=" on the same scontrol output, which
+  # corrupted NODE_LIST with extra garbage lines/values.
+  NODE_LIST=$(oc exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -- scontrol show job "$JOB_ID" 2>/dev/null \
+    | grep -oE '(^|[[:space:]])NodeList=[^ ]*' | head -1 | awk -F= '{print $2}')
   if [ -n "$NODE_LIST" ]; then
     log_info "Job ran on: $NODE_LIST"
     # Derive pod name from Slurm node name (slinky-N → slurm-worker-slinky-N)

@@ -1,0 +1,33 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.iml
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+logs/
+*.out
+*.err
+
+# Training/demo results (local only — retrieved job artifacts, checkpoints, metrics)
+results/*
+!results/.gitkeep
+
+# Secrets and keys (never commit!)
+*.key
+*.pem
+*.crt

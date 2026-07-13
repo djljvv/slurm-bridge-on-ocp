@@ -52,7 +52,7 @@ if [ "$DRY_RUN" = true ]; then
   log "[DRY RUN] Would run the following steps:"
   log "  1. deploy-operator.sh --operator-ns $OPERATOR_NS"
   log "  2. deploy-slurm.sh --namespace $NAMESPACE"
-  log "  3. deploy-bridge.sh --operator-ns $OPERATOR_NS"
+  log "  3. deploy-bridge.sh --namespace $NAMESPACE"
   log "  4. deploy-autoscale.sh (namespace: $NAMESPACE)"
   exit 0
 fi
@@ -70,9 +70,10 @@ section "Step 2/4 — Slurm Cluster"
 NAMESPACE="$NAMESPACE" OPERATOR_NS="$OPERATOR_NS" "${SCRIPT_DIR}/deploy-slurm.sh" \
   --namespace "$NAMESPACE" --operator-ns "$OPERATOR_NS"
 
-# Step 3: Slurm Bridge
+# Step 3: Slurm Bridge (installed into the Slurm cluster namespace — Bridge's
+# Token CR needs the JWT secret that lives there, not the operator namespace)
 section "Step 3/4 — Slurm Bridge"
-OPERATOR_NS="$OPERATOR_NS" "${SCRIPT_DIR}/deploy-bridge.sh" --operator-ns "$OPERATOR_NS"
+NAMESPACE="$NAMESPACE" "${SCRIPT_DIR}/deploy-bridge.sh" --namespace "$NAMESPACE"
 
 # Step 4: Autoscaler
 section "Step 4/4 — Autoscaler"
@@ -81,7 +82,7 @@ NAMESPACE="$NAMESPACE" "${SCRIPT_DIR}/deploy-autoscale.sh" --namespace "$NAMESPA
 # Done
 section "Deployment Complete"
 log "Slurm cluster:    oc get pods -n $NAMESPACE"
-log "Bridge:           oc get pods -n $OPERATOR_NS | grep bridge"
+log "Bridge:           oc get pods -n $NAMESPACE | grep bridge"
 log "Autoscaler logs:  oc logs -n $NAMESPACE -l app.kubernetes.io/name=slurm-autoscaler -f"
 echo ""
 log "Test cluster:"
