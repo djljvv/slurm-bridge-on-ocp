@@ -1,0 +1,6 @@
+# Used by Dockerfile.cpu (pip install --extra-index-url .../whl/cpu).
+# The GPU Dockerfile (pytorch/pytorch base) already has torch pre-installed
+# and only pip-installs transformers + pandas directly.
+torch==2.5.1
+transformers==4.46.3
+pandas==2.2.3

@@ -45,8 +45,18 @@ section "Deploying Slurm cluster (namespace: $NAMESPACE)"
 oc create namespace "$NAMESPACE" 2>/dev/null || true
 
 log "Granting anyuid SCC to default service account..."
-oc adm policy add-scc-to-user anyuid -z default -n "$NAMESPACE" 2>/dev/null || \
-  warn "anyuid SCC may already be granted"
+# NOTE: add-scc-to-user is idempotent — it does not error out if the grant
+# already exists, so a non-zero exit here means a REAL failure (bad RBAC
+# permissions, a transient API error, etc.), not "already granted". Treating
+# failures as benign previously masked a live failure (during dev/testing,
+# these calls silently failed and pods spent minutes stuck in SCC-forbidden
+# errors before anyone noticed the grants had never actually applied) — fail
+# loudly instead so it's caught immediately, since the controller/worker pods
+# cannot schedule at all without these.
+if ! oc adm policy add-scc-to-user anyuid -z default -n "$NAMESPACE"; then
+  error "Failed to grant anyuid SCC — pods will be stuck in SCC-forbidden errors without it. Check permissions and retry."
+  exit 1
+fi
 
 # slurmd requires privileged mode + BPF/NET_ADMIN/SYS_ADMIN capabilities
 # (cgroup + process/network management). Without this, NodeSet pods
@@ -54,8 +64,10 @@ oc adm policy add-scc-to-user anyuid -z default -n "$NAMESPACE" 2>/dev/null || \
 # "unable to validate against any security context constraint" and the
 # NodeSet can never scale above 0 replicas — anyuid alone is not enough.
 log "Granting privileged SCC to default service account (required by slurmd)..."
-oc adm policy add-scc-to-user privileged -z default -n "$NAMESPACE" 2>/dev/null || \
-  warn "privileged SCC may already be granted"
+if ! oc adm policy add-scc-to-user privileged -z default -n "$NAMESPACE"; then
+  error "Failed to grant privileged SCC — pods will be stuck in SCC-forbidden errors without it. Check permissions and retry."
+  exit 1
+fi
 
 # Install Slurm via Helm (includes controller, nodeset, restapi)
 log "Installing Slurm via Helm chart (version 1.2.0)..."

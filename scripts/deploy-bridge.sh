@@ -156,6 +156,21 @@ done
 
 log "Labeled $count worker node(s) for Slurm"
 
+gpu_count=0
+for node in $(oc get nodes -o jsonpath='{range .items[?(@.status.capacity.nvidia\.com/gpu)]}{.metadata.name}{"\n"}{end}'); do
+  log "Labeling GPU node: $node"
+  oc patch "node/$node" \
+    -p '{"metadata":{"labels":{"scheduler.slinky.slurm.net/external-node":"true"},"annotations":{"scheduler.slinky.slurm.net/external-node-partitions":"all"}}}' \
+    --type=merge
+  gpu_count=$((gpu_count + 1))
+done
+
+if [ "$gpu_count" -gt 0 ]; then
+  log "Labeled $gpu_count GPU node(s) for Slurm"
+else
+  log "No GPU nodes found — GPU workloads will not be schedulable"
+fi
+
 # ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------

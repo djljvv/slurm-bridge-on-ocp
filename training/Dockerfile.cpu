@@ -1,0 +1,37 @@
+# Text classifier fine-tuning image for the Slurm Bridge demo.
+#
+# Bakes both the CPU-only PyTorch stack AND the pretrained model/tokenizer
+# weights into the image at build time, so the training Job never needs
+# Hugging Face Hub egress from inside the cluster at runtime — consistent
+# with how the dataset is vendored under training/data/.
+#
+# Build (from repo root):
+#   podman build -t <registry>/<repo>/slurm-bridge-text-classifier:latest -f training/Dockerfile training/
+#   podman push <registry>/<repo>/slurm-bridge-text-classifier:latest
+FROM python:3.11-slim
+
+ARG MODEL_NAME=distilbert-base-uncased
+ARG NUM_LABELS=4
+ENV HF_HOME=/app/.cache/huggingface \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+    -r requirements.txt
+
+# Pre-download the pretrained encoder + tokenizer so the image is
+# self-contained. The classification head is randomly initialized at
+# fine-tuning time (from_pretrained with num_labels), not baked in here.
+RUN python -c "\
+from transformers import AutoTokenizer, AutoModelForSequenceClassification; \
+AutoTokenizer.from_pretrained('${MODEL_NAME}'); \
+AutoModelForSequenceClassification.from_pretrained('${MODEL_NAME}', num_labels=${NUM_LABELS})"
+
+COPY train.py predict.py .
+COPY data/ ./data/
+COPY data-full/ ./data-full/
+
+ENTRYPOINT ["torchrun"]
+CMD ["--nnodes=1", "--nproc_per_node=2", "/app/train.py"]

@@ -37,7 +37,7 @@ helm install cert-manager jetstack/cert-manager \
 ./scripts/deploy.sh --namespace my-slurm --operator-ns slinky
 ```
 
-The script deploys all four components in order and waits for each to be ready.
+The script deploys all three components in order and waits for each to be ready.
 
 ---
 
@@ -137,15 +137,17 @@ for node in $(oc get nodes -o name -l node-role.kubernetes.io/worker='' | head -
     -p '{"metadata":{"labels":{"scheduler.slinky.slurm.net/external-node":"true"},"annotations":{"scheduler.slinky.slurm.net/external-node-partitions":"all"}}}' \
     --type=merge
 done
-```
 
-### Step 4: Deploy Autoscaler
-
-```bash
-./scripts/deploy-autoscale.sh
-
-# Monitor autoscaler
-oc logs -n slurm -l app.kubernetes.io/name=slurm-autoscaler -f
+# 5. (Optional) Label GPU nodes for Bridge scheduling
+#    The loop above only labels the first 3 generic worker nodes. If you plan
+#    to run GPU workloads (--gpu flag in the demo script), the GPU nodes must
+#    also be labeled — otherwise Bridge has nowhere to place pods that request
+#    nvidia.com/gpu and they stay Pending with "Insufficient nvidia.com/gpu".
+for node in $(oc get nodes -o jsonpath='{range .items[?(@.status.capacity.nvidia\.com/gpu)]}{.metadata.name}{"\n"}{end}'); do
+  oc patch "node/$node" \
+    -p '{"metadata":{"labels":{"scheduler.slinky.slurm.net/external-node":"true"},"annotations":{"scheduler.slinky.slurm.net/external-node-partitions":"all"}}}' \
+    --type=merge
+done
 ```
 
 ---
@@ -158,41 +160,43 @@ oc get pods -n slurm
 oc get pods -n slurm | grep bridge
 ```
 
-> **Note:** `./scripts/test-slurm.sh` (its default "quick" mode) currently fails on a fresh
-> deployment — it submits an `sbatch` job immediately, before any `slinky-N` worker has ever
-> registered, and hits the same rejection described below. This script has not yet been
-> updated to account for that; don't treat a failure there as a sign your deployment is
-> broken.
-
-Submit a job through Bridge to confirm the end-to-end path works (this is the path that
-actually functions out of the box — see the caveat below for why a plain `sbatch` example
-isn't shown here):
+Submit a job through Bridge to confirm the end-to-end path works:
 
 ```bash
-oc label namespace default managed-by-slurm=true
-oc run bridge-test --image=quay.io/prometheus/busybox --restart=Never \
+oc project default
+oc label namespace default managed-by-slurm=true --overwrite
+oc delete pod bridge-test -n default --ignore-not-found
+oc run bridge-test -n default --image=quay.io/prometheus/busybox --restart=Never \
   --overrides='{"metadata":{"annotations":{"slurmjob.slinky.slurm.net/account":"slurm","slurmjob.slinky.slurm.net/partition":"all"}}}' \
   -- sh -c "hostname && date"
+
+# Wait for Bridge to schedule the pod through Slurm and for the container to finish
+oc wait --for=condition=Ready pod/bridge-test -n default --timeout=120s 2>/dev/null || true
+oc wait --for=jsonpath='{.status.phase}'=Succeeded pod/bridge-test -n default --timeout=120s
 
 # Confirm it ran as a Slurm job
 CTRL=$(oc get pods -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')
 oc exec -n slurm $CTRL -c slurmctld -- squeue
-oc logs bridge-test
+oc logs bridge-test -n default
 ```
 
-**Do not expect a plain `sbatch --nodes=N ...` example to demonstrate autoscaling** — under
-this chart's default config (`MIN_REPLICAS=0`, no NodeSet workers registered yet), Slurm
-rejects such a request immediately (`Requested node configuration is not available`) instead
-of queuing it `PENDING`, so the autoscaler never gets a chance to react. This was confirmed by
-live testing, not just code review. See
-[`docs/ARCHITECTURE.md`](ARCHITECTURE.md#autoscaler) for the full explanation and what
-`sbatch` behavior to actually expect.
+Run the PyTorch demo:
+
+```bash
+# CPU
+./demos/text-classifier-demo.sh --image <your-training-image>
+
+# GPU (requires NVIDIA GPU Operator on cluster)
+./demos/text-classifier-demo.sh --image <your-training-image> --gpu 1
+```
+
+See [`docs/DEMO.md`](DEMO.md) for image build instructions.
 
 ---
 
 ## Using Slurm Bridge
 
-To submit jobs through Bridge (instead of direct sbatch), label the workload namespace:
+To submit jobs through Bridge, label the workload namespace:
 
 ```bash
 oc label namespace <your-namespace> managed-by-slurm=true
@@ -232,27 +236,16 @@ oc get svc -n slurm | grep restapi
 oc logs -n slurm -l app.kubernetes.io/name=slurm-bridge-controllers
 ```
 
-**Autoscaler not scaling up:**
-
-This is expected, not a misconfiguration you need to debug — see the "Known limitation" note
-in [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#autoscaler). In short: a direct `sbatch` job
-requesting more nodes than are currently registered gets rejected by Slurm immediately
-(`Requested node configuration is not available`) instead of going `PENDING`, so the
-autoscaler — which only reacts to `PENDING` jobs in `squeue` — never has anything to scale up
-in response to. This happens regardless of whether the NodeSet starts at 0 or already has
-workers registered.
-
+**GPU pods stuck in Pending ("Insufficient nvidia.com/gpu"):**
+The deploy script only labels the first 3 generic worker nodes as Bridge external nodes.
+GPU nodes need the label too, or Bridge can't schedule GPU workloads onto them:
 ```bash
-oc logs -n slurm -l app.kubernetes.io/name=slurm-autoscaler --tail=30
-# If you see repeated "IDLE: no jobs" with no PENDING jobs ever appearing in squeue even
-# though you submitted one, that confirms the job was rejected at submission, not queued:
-CTRL=$(oc get pods -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')
-oc exec -n slurm $CTRL -c slurmctld -- squeue
+for node in $(oc get nodes -o jsonpath='{range .items[?(@.status.capacity.nvidia\.com/gpu)]}{.metadata.name}{"\n"}{end}'); do
+  oc patch "node/$node" \
+    -p '{"metadata":{"labels":{"scheduler.slinky.slurm.net/external-node":"true"},"annotations":{"scheduler.slinky.slurm.net/external-node-partitions":"all"}}}' \
+    --type=merge
+done
 ```
-
-Workarounds: submit through Bridge instead (works from zero, see Verification above), or
-manually scale first — `oc scale nodeset slurm-worker-slinky -n slurm --replicas=N` — then
-submit a job that fits within N nodes.
 
 **RBAC patch warning:**
 If the Bridge scheduler pod is crashing with permission errors, reapply the patch:

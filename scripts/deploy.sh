@@ -8,7 +8,6 @@ set -euo pipefail
 #   1. Slurm Operator (Slinky CRDs + operator)
 #   2. Slurm Cluster (controller + nodeset + REST API via Helm)
 #   3. Slurm Bridge (token + admission controller + scheduler + node labels)
-#   4. Autoscaler (queue-driven scale-up/down watchdog)
 #
 # Usage:
 #   ./scripts/deploy.sh
@@ -29,7 +28,7 @@ while [[ $# -gt 0 ]]; do
     --operator-ns)  OPERATOR_NS="$2"; shift 2 ;;
     --skip-operator) SKIP_OPERATOR=true; shift ;;
     --dry-run)      DRY_RUN=true; shift ;;
-    --help|-h) sed -n '3,13p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    --help|-h) sed -n '3,12p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -53,41 +52,37 @@ if [ "$DRY_RUN" = true ]; then
   log "  1. deploy-operator.sh --operator-ns $OPERATOR_NS"
   log "  2. deploy-slurm.sh --namespace $NAMESPACE"
   log "  3. deploy-bridge.sh --namespace $NAMESPACE"
-  log "  4. deploy-autoscale.sh (namespace: $NAMESPACE)"
   exit 0
 fi
 
 # Step 1: Operator
 if [ "$SKIP_OPERATOR" = false ]; then
-  section "Step 1/4 — Slurm Operator"
+  section "Step 1/3 — Slurm Operator"
   OPERATOR_NS="$OPERATOR_NS" "${SCRIPT_DIR}/deploy-operator.sh" --operator-ns "$OPERATOR_NS"
 else
   log "Skipping operator installation (--skip-operator)"
 fi
 
 # Step 2: Slurm cluster
-section "Step 2/4 — Slurm Cluster"
+section "Step 2/3 — Slurm Cluster"
 NAMESPACE="$NAMESPACE" OPERATOR_NS="$OPERATOR_NS" "${SCRIPT_DIR}/deploy-slurm.sh" \
   --namespace "$NAMESPACE" --operator-ns "$OPERATOR_NS"
 
 # Step 3: Slurm Bridge (installed into the Slurm cluster namespace — Bridge's
 # Token CR needs the JWT secret that lives there, not the operator namespace)
-section "Step 3/4 — Slurm Bridge"
+section "Step 3/3 — Slurm Bridge"
 NAMESPACE="$NAMESPACE" "${SCRIPT_DIR}/deploy-bridge.sh" --namespace "$NAMESPACE"
-
-# Step 4: Autoscaler
-section "Step 4/4 — Autoscaler"
-NAMESPACE="$NAMESPACE" "${SCRIPT_DIR}/deploy-autoscale.sh" --namespace "$NAMESPACE"
 
 # Done
 section "Deployment Complete"
 log "Slurm cluster:    oc get pods -n $NAMESPACE"
 log "Bridge:           oc get pods -n $NAMESPACE | grep bridge"
-log "Autoscaler logs:  oc logs -n $NAMESPACE -l app.kubernetes.io/name=slurm-autoscaler -f"
 echo ""
-log "Test cluster:"
-log "  ./scripts/test-slurm.sh --namespace $NAMESPACE"
+log "Quick smoke test (Bridge-routed pod):"
+log "  oc label namespace default managed-by-slurm=true"
+log "  oc run bridge-test --image=quay.io/prometheus/busybox --restart=Never \\"
+log "    --overrides='{\"metadata\":{\"annotations\":{\"slurmjob.slinky.slurm.net/account\":\"slurm\",\"slurmjob.slinky.slurm.net/partition\":\"all\"}}}' \\"
+log "    -- sh -c \"hostname && date\""
 echo ""
-log "Submit a job (autoscaler will scale up automatically):"
-log "  CTRL=\$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')"
-log "  oc exec -n $NAMESPACE \$CTRL -c slurmctld -- sbatch --nodes=2 --wrap=\"hostname\""
+log "PyTorch workload demo:"
+log "  ./demos/text-classifier-demo.sh --image <your-training-image>"

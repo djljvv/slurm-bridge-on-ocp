@@ -43,20 +43,13 @@ section "Slurm Bridge on OCP — Cleanup"
 log "Namespace: $NAMESPACE | Operator ns: $OPERATOR_NS | Remove operator: $REMOVE_OPERATOR"
 
 # ---------------------------------------------------------------------------
-# 1. Autoscaler
-# ---------------------------------------------------------------------------
-section "Removing autoscaler"
-run_ignore oc delete -f "${REPO_ROOT}/configs/slurm-autoscaler.yaml" --ignore-not-found --timeout=30s
-run_ignore oc delete configmap slurm-autoscaler-script -n "$NAMESPACE" --ignore-not-found --timeout=30s
-
-# ---------------------------------------------------------------------------
-# 2. Bridge (lives in the Slurm cluster namespace, not the operator namespace)
+# 1. Bridge (lives in the Slurm cluster namespace, not the operator namespace)
 # ---------------------------------------------------------------------------
 section "Removing Slurm Bridge"
 "${SCRIPT_DIR}/deploy-bridge.sh" --namespace "$NAMESPACE" --teardown 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 3. Slurm cluster
+# 2. Slurm cluster
 # ---------------------------------------------------------------------------
 section "Removing Slurm cluster"
 if oc get namespace "$NAMESPACE" &>/dev/null; then
@@ -69,7 +62,6 @@ if oc get namespace "$NAMESPACE" &>/dev/null; then
   run_ignore oc delete controller,nodeset,restapi --all -n "$NAMESPACE" --ignore-not-found --timeout=60s
   run_ignore oc adm policy remove-scc-from-user anyuid -z default -n "$NAMESPACE"
   run_ignore oc adm policy remove-scc-from-user privileged -z default -n "$NAMESPACE"
-  run_ignore oc adm policy remove-scc-from-user privileged -z slurm-autoscaler -n "$NAMESPACE"
   oc delete namespace "$NAMESPACE" --ignore-not-found --timeout=120s 2>/dev/null || \
     warn "Namespace $NAMESPACE may still be terminating"
 else
@@ -77,7 +69,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Operator (optional)
+# 3. Operator (optional)
 # ---------------------------------------------------------------------------
 if [ "$REMOVE_OPERATOR" = true ]; then
   section "Removing Slurm Operator"
