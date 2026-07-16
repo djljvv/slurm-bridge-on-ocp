@@ -49,6 +49,17 @@ section "Removing Slurm Bridge"
 "${SCRIPT_DIR}/deploy-bridge.sh" --namespace "$NAMESPACE" --teardown 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
+# 1b. Remove Bridge node labels, annotations, and taints
+# ---------------------------------------------------------------------------
+section "Removing Bridge node labels and taints"
+for node in $(oc get nodes -l scheduler.slinky.slurm.net/external-node=true -o name 2>/dev/null); do
+  log "Cleaning: $node"
+  run_ignore oc label "$node" scheduler.slinky.slurm.net/external-node-
+  run_ignore oc annotate "$node" scheduler.slinky.slurm.net/external-node-partitions-
+  run_ignore oc adm taint node "$node" slinky.slurm.net/managed-node-
+done
+
+# ---------------------------------------------------------------------------
 # 2. Slurm cluster
 # ---------------------------------------------------------------------------
 section "Removing Slurm cluster"
